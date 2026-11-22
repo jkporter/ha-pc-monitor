@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/HassHwStats/HassHwStats.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/HassHwStats.Tests/HassHwStats.Tests.csproj" />
+  </Folder>
+</Solution>
