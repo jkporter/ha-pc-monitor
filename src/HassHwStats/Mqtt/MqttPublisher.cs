@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using HassHwStats.Core;
 using Microsoft.Extensions.Logging;
@@ -6,7 +7,10 @@ using MQTTnet.Protocol;
 
 namespace HassHwStats.Mqtt;
 
-/// <summary>Keeps an MQTT connection, publishes HA discovery (retained) and the state of every device each interval.</summary>
+/// <summary>
+/// Keeps an MQTT connection, publishes HA device discovery (retained) and the state of every device each interval.
+/// Migrates entities left behind by the single-component discovery of versions before 0.4 without changing their entity IDs.
+/// </summary>
 public sealed class MqttPublisher : IAsyncDisposable
 {
     private readonly MqttOptions _options;
@@ -14,7 +18,11 @@ public sealed class MqttPublisher : IAsyncDisposable
     private readonly ILogger _log;
     private readonly IMqttClient _client;
     private readonly MqttClientOptions _clientOptions;
-    private readonly Dictionary<string, SensorDefinition> _announced = new();
+    // Every entity seen per device during this run. A device config always lists all of them, because HA removes
+    // entities that disappear from a device config.
+    private readonly Dictionary<string, Dictionary<string, SensorDefinition>> _components = new();
+    private readonly Dictionary<string, string> _publishedConfig = new();
+    private readonly ConcurrentDictionary<string, byte> _legacyTopics = new();
     private readonly object _gate = new();
     private volatile bool _rediscover;
     private DateTime _nextConnectAttempt = DateTime.MinValue;
@@ -49,6 +57,14 @@ public sealed class MqttPublisher : IAsyncDisposable
 
         _client.ApplicationMessageReceivedAsync += e =>
         {
+            var topic = e.ApplicationMessage.Topic;
+            if (topic != payloads.HomeAssistantStatusTopic && !topic.Contains("/device/"))
+            {
+                // A retained single-component config from an older version (ignore our own migrate/clear messages).
+                var body = e.ApplicationMessage.ConvertPayloadToString();
+                if (!string.IsNullOrEmpty(body) && body != HomeAssistantPayloads.MigratePayload) _legacyTopics.TryAdd(topic, 0);
+                return Task.CompletedTask;
+            }
             // Home Assistant restarted: it forgets non-retained state, so announce everything again.
             if (e.ApplicationMessage.Topic == payloads.HomeAssistantStatusTopic && e.ApplicationMessage.ConvertPayloadToString() == "online")
             {
@@ -82,7 +98,11 @@ public sealed class MqttPublisher : IAsyncDisposable
             _log.LogInformation("Connected to MQTT broker {Host}:{Port}", _options.Host, _options.Port);
             await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(_payloads.HomeAssistantStatusTopic).Build(), ct);
             await PublishAsync(_payloads.AvailabilityTopic, "online", retain: true, ct);
-            lock (_gate) _announced.Clear(); // a fresh session re-announces everything
+            // Retained legacy configs arrive right after subscribing; give them a moment.
+            await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(_payloads.LegacyDiscoveryFilter).Build(), ct);
+            await Task.Delay(1000, ct);
+            if (!_legacyTopics.IsEmpty) _log.LogInformation("Found {Count} single-component discovery configs from an older version; migrating them to device discovery", _legacyTopics.Count);
+            lock (_gate) _publishedConfig.Clear(); // a fresh session re-announces everything
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -101,23 +121,47 @@ public sealed class MqttPublisher : IAsyncDisposable
             if (_rediscover)
             {
                 _rediscover = false;
-                lock (_gate) _announced.Clear();
+                lock (_gate) _publishedConfig.Clear();
                 await PublishAsync(_payloads.AvailabilityTopic, "online", retain: true, ct);
             }
 
             bool announcedAny = false;
-            foreach (var v in values)
+            var migrated = new List<string>();
+            foreach (var group in values.GroupBy(v => v.Definition.Device.Id))
             {
-                var def = v.Definition;
-                bool isNew;
-                lock (_gate) isNew = _announced.TryAdd(def.Key, def);
-                if (!isNew) continue;
-                await PublishAsync(_payloads.DiscoveryTopic(def), _payloads.DiscoveryPayload(def), retain: true, ct);
+                var device = group.Last().Definition.Device; // latest details (e.g. firmware after connecting)
+                string payload;
+                List<SensorDefinition> defs;
+                lock (_gate)
+                {
+                    if (!_components.TryGetValue(device.Id, out var comps)) _components[device.Id] = comps = new();
+                    foreach (var v in group) comps[v.Definition.Key] = v.Definition;
+                    defs = comps.Values.ToList();
+                    payload = _payloads.DevicePayload(device, defs);
+                    if (_publishedConfig.TryGetValue(device.Id, out var last) && last == payload) continue;
+                }
+
+                // HA's documented migration: tell each old config to hand its entity over, then publish the device config.
+                var legacy = defs.Select(_payloads.LegacyDiscoveryTopic).Where(_legacyTopics.ContainsKey).ToList();
+                foreach (var topic in legacy) await PublishAsync(topic, HomeAssistantPayloads.MigratePayload, retain: true, ct);
+                if (legacy.Count > 0) await Task.Delay(500, ct);
+
+                await PublishAsync(_payloads.DeviceDiscoveryTopic(device), payload, retain: true, ct);
+                lock (_gate) _publishedConfig[device.Id] = payload;
+                migrated.AddRange(legacy);
                 announcedAny = true;
             }
 
             // Give HA a moment to create freshly discovered entities before their first state arrives.
             if (announcedAny) await Task.Delay(500, ct);
+
+            // Then clear the old retained configs so they are gone for good.
+            foreach (var topic in migrated)
+            {
+                await PublishAsync(topic, "", retain: true, ct);
+                _legacyTopics.TryRemove(topic, out _);
+            }
+            if (migrated.Count > 0) _log.LogInformation("Migrated {Count} entities to device discovery", migrated.Count);
 
             foreach (var group in values.GroupBy(v => v.Definition.Device.Id))
             {

@@ -65,10 +65,11 @@ Every setting can also come from an environment variable, e.g. `HASSHWSTATS_Mqtt
 
 ## MQTT layout
 
+- Discovery: **device-based**. One retained config per HA device at `homeassistant/device/<node>_<device>/config`, with every entity under `components` (for example `homeassistant/device/gaming_pc_wireview/config`). The list only grows during a run, so a disconnected WireView shows its entities as *unavailable* rather than removing them. Re-sent when HA publishes `online` on `homeassistant/status`.
 - Availability: `hass-hw-stats/<node>/status` → `online` / `offline` (retained, last will).
-- State: one JSON object per device every interval, e.g. `hass-hw-stats/<node>/wireview_<uid>/state` → `{"wireview_total_power":412.3,"wireview_pin1_current":8.12,...}`.
-- Discovery: `homeassistant/sensor/<node>/<key>/config` (retained). Re-sent when HA publishes `online` on `homeassistant/status`.
+- State: one JSON object per device every interval, e.g. `hass-hw-stats/<node>/wireview/state` → `{"wireview_total_power":412.3,"wireview_pin1_current":8.12,...}`.
 - A value missing from a reading (unplugged WireView, sensor not present) makes just that entity *unavailable*.
+- **Upgrading from 0.3 or older** (single-component discovery at `homeassistant/sensor/<node>/<key>/config`): on first start, 0.4 finds those retained configs, sends HA's `{"migrate_discovery": true}` to each, publishes the device configs with the same `unique_id`s, then clears the old topics. Entity IDs, history and any renames you made are kept.
 
 ## WireView not showing up?
 

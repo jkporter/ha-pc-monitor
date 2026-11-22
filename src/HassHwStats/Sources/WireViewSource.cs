@@ -37,7 +37,9 @@ public sealed class WireViewSource(WireViewOptions options, ILogger<WireViewSour
         if (_useUsb) TryConnect();
     }
 
-    public IReadOnlyList<SensorValue> Poll()
+    public IReadOnlyList<SensorValue> Poll() => _entities.Complete(PollCore(), options.PublishPins);
+
+    private IReadOnlyList<SensorValue> PollCore()
     {
         if (_useUsb && _port is not null)
         {

@@ -5,9 +5,15 @@ using HassHwStats.Core;
 
 namespace HassHwStats.Mqtt;
 
-/// <summary>Builds MQTT topics and payloads for Home Assistant MQTT discovery. Pure functions so they can be tested.</summary>
+/// <summary>
+/// Builds MQTT topics and payloads for Home Assistant MQTT discovery. Uses device-based discovery: one retained
+/// config per device at {prefix}/device/{node}_{device}/config that lists every entity under "components".
+/// Pure functions so they can be tested.
+/// </summary>
 public sealed class HomeAssistantPayloads(string discoveryPrefix, string baseTopic, string nodeName, HaDevice pcDevice, string swVersion)
 {
+    public const string ProjectUrl = "https://github.com/jkporter/ha-pc-monitor";
+
     public string NodeId { get; } = Slug.Make(nodeName);
 
     public string AvailabilityTopic => $"{baseTopic}/{NodeId}/status";
@@ -15,69 +21,96 @@ public sealed class HomeAssistantPayloads(string discoveryPrefix, string baseTop
 
     public string StateTopic(HaDevice device) => $"{baseTopic}/{NodeId}/{device.Id}/state";
 
-    public string DiscoveryTopic(SensorDefinition def) =>
-        $"{discoveryPrefix}/{(def.Kind == EntityKind.BinarySensor ? "binary_sensor" : "sensor")}/{NodeId}/{def.Key}/config";
+    public string DeviceDiscoveryTopic(HaDevice device) => $"{discoveryPrefix}/device/{DeviceIdentifier(device)}/config";
+
+    /// <summary>Where versions before 0.4 published single-component discovery for this entity.</summary>
+    public string LegacyDiscoveryTopic(SensorDefinition def) =>
+        $"{discoveryPrefix}/{Platform(def)}/{NodeId}/{def.Key}/config";
+
+    /// <summary>Subscription filter matching every legacy single-component config this node may have left behind.</summary>
+    public string LegacyDiscoveryFilter => $"{discoveryPrefix}/+/{NodeId}/+/config";
+
+    public string UniqueId(SensorDefinition def) => $"{NodeId}_{def.Key}";
+
+    private static string Platform(SensorDefinition def) => def.Kind == EntityKind.BinarySensor ? "binary_sensor" : "sensor";
 
     private string DeviceIdentifier(HaDevice d) => $"{NodeId}_{d.Id}";
 
-    public string DiscoveryPayload(SensorDefinition def)
+    /// <summary>The device discovery payload: device, origin, shared state topic and one component per entity.</summary>
+    public string DevicePayload(HaDevice device, IEnumerable<SensorDefinition> defs)
     {
         using var ms = new MemoryStream();
         using (var w = new Utf8JsonWriter(ms))
         {
             w.WriteStartObject();
-            w.WriteString("name", def.Name);
-            w.WriteString("unique_id", $"{NodeId}_{def.Key}");
-            w.WriteString("state_topic", StateTopic(def.Device));
-            if (def.Kind == EntityKind.BinarySensor)
-            {
-                w.WriteString("value_template", $"{{{{ 'ON' if value_json.{def.Key} else 'OFF' }}}}");
-            }
-            else
-            {
-                w.WriteString("value_template", $"{{{{ value_json.{def.Key} }}}}");
-            }
-
-            // Online only when the PC is up AND this value was present in the latest reading.
-            w.WriteStartArray("availability");
-            w.WriteStartObject();
-            w.WriteString("topic", AvailabilityTopic);
-            w.WriteEndObject();
-            w.WriteStartObject();
-            w.WriteString("topic", StateTopic(def.Device));
-            w.WriteString("value_template", $"{{{{ 'online' if value_json.{def.Key} is defined and value_json.{def.Key} is not none else 'offline' }}}}");
-            w.WriteEndObject();
-            w.WriteEndArray();
-            w.WriteString("availability_mode", "all");
-
-            if (def.Unit is not null) w.WriteString("unit_of_measurement", def.Unit);
-            if (def.DeviceClass is not null) w.WriteString("device_class", def.DeviceClass);
-            if (def.StateClass is not null && def.Kind == EntityKind.Sensor) w.WriteString("state_class", def.StateClass);
-            if (def.Icon is not null) w.WriteString("icon", def.Icon);
-            if (def.Precision is { } p && def.Kind == EntityKind.Sensor && def.Unit is not null) w.WriteNumber("suggested_display_precision", p);
-            if (def.EntityCategory is not null) w.WriteString("entity_category", def.EntityCategory);
 
             w.WriteStartObject("device");
             w.WriteStartArray("identifiers");
-            w.WriteStringValue(DeviceIdentifier(def.Device));
+            w.WriteStringValue(DeviceIdentifier(device));
             w.WriteEndArray();
-            w.WriteString("name", def.Device.Name);
-            if (def.Device.Model is not null) w.WriteString("model", def.Device.Model);
-            if (def.Device.Manufacturer is not null) w.WriteString("manufacturer", def.Device.Manufacturer);
-            if (def.Device.SwVersion is not null) w.WriteString("sw_version", def.Device.SwVersion);
-            if (def.Device.SerialNumber is not null) w.WriteString("serial_number", def.Device.SerialNumber);
-            if (def.Device.Id != pcDevice.Id) w.WriteString("via_device", DeviceIdentifier(pcDevice));
+            w.WriteString("name", device.Name);
+            if (device.Model is not null) w.WriteString("model", device.Model);
+            if (device.Manufacturer is not null) w.WriteString("manufacturer", device.Manufacturer);
+            if (device.SwVersion is not null) w.WriteString("sw_version", device.SwVersion);
+            if (device.SerialNumber is not null) w.WriteString("serial_number", device.SerialNumber);
+            if (device.Id != pcDevice.Id) w.WriteString("via_device", DeviceIdentifier(pcDevice));
             w.WriteEndObject();
 
             w.WriteStartObject("origin");
             w.WriteString("name", "HassHwStats");
-            w.WriteString("sw", swVersion);
+            w.WriteString("sw_version", swVersion);
+            w.WriteString("support_url", ProjectUrl);
+            w.WriteEndObject();
+
+            // Shared by every component.
+            w.WriteString("state_topic", StateTopic(device));
+            w.WriteNumber("qos", 1);
+
+            w.WriteStartObject("components");
+            foreach (var def in defs.OrderBy(d => d.Key, StringComparer.Ordinal))
+            {
+                w.WriteStartObject(def.Key);
+                WriteComponent(w, def);
+                w.WriteEndObject();
+            }
             w.WriteEndObject();
 
             w.WriteEndObject();
         }
         return Encoding.UTF8.GetString(ms.ToArray());
     }
+
+    private void WriteComponent(Utf8JsonWriter w, SensorDefinition def)
+    {
+        w.WriteString("platform", Platform(def));
+        w.WriteString("name", def.Name);
+        w.WriteString("unique_id", UniqueId(def));
+        w.WriteString("value_template", def.Kind == EntityKind.BinarySensor
+            ? $"{{{{ 'ON' if value_json.{def.Key} else 'OFF' }}}}"
+            : $"{{{{ value_json.{def.Key} }}}}");
+
+        // Online only when the PC is up AND this value was present in the latest reading.
+        w.WriteStartArray("availability");
+        w.WriteStartObject();
+        w.WriteString("topic", AvailabilityTopic);
+        w.WriteEndObject();
+        w.WriteStartObject();
+        w.WriteString("topic", StateTopic(def.Device));
+        w.WriteString("value_template", $"{{{{ 'online' if value_json.{def.Key} is defined and value_json.{def.Key} is not none else 'offline' }}}}");
+        w.WriteEndObject();
+        w.WriteEndArray();
+        w.WriteString("availability_mode", "all");
+
+        if (def.Unit is not null) w.WriteString("unit_of_measurement", def.Unit);
+        if (def.DeviceClass is not null) w.WriteString("device_class", def.DeviceClass);
+        if (def.StateClass is not null && def.Kind == EntityKind.Sensor) w.WriteString("state_class", def.StateClass);
+        if (def.Icon is not null) w.WriteString("icon", def.Icon);
+        if (def.Precision is { } p && def.Kind == EntityKind.Sensor && def.Unit is not null) w.WriteNumber("suggested_display_precision", p);
+        if (def.EntityCategory is not null) w.WriteString("entity_category", def.EntityCategory);
+    }
+
+    /// <summary>Sent to a legacy single-component topic before the device config takes over its entity.</summary>
+    public const string MigratePayload = """{"migrate_discovery":true}""";
 
     /// <summary>One JSON object per HA device: { "key": value, ... }. Numbers are rounded to the sensor's precision.</summary>
     public static string StatePayload(IEnumerable<SensorValue> values)

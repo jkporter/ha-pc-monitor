@@ -55,6 +55,23 @@ public sealed class WireViewEntities
     public SensorDefinition[] PinA { get; }
     public SensorDefinition[] PinW { get; }
 
+    /// <summary>Every entity of this device, so the device config never shrinks while it is disconnected.</summary>
+    public IEnumerable<SensorDefinition> All(bool pins)
+    {
+        SensorDefinition[] main = [Status, Connected, TotalPower, TotalCurrent, AvgVoltage, TempIn, TempOut, TempExt1, TempExt2,
+            Fan, Cable, MaxPin, Imbalance, Fault, ActiveFaults, LoggedFaults];
+        return pins ? main.Concat(PinV).Concat(PinA).Concat(PinW) : main;
+    }
+
+    /// <summary>Adds an unknown (null) value for every entity the reading did not include.</summary>
+    public List<SensorValue> Complete(IReadOnlyList<SensorValue> values, bool pins)
+    {
+        var have = values.Select(v => v.Definition.Key).ToHashSet();
+        var list = values.ToList();
+        list.AddRange(All(pins).Where(d => !have.Contains(d.Key)).Select(d => new SensorValue(d, null)));
+        return list;
+    }
+
     /// <summary>HA limits a state to 255 characters.</summary>
     public SensorValue StatusValue(string text) => new(Status, text.Length <= 255 ? text : text[..252] + "...");
 
