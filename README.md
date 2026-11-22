@@ -88,11 +88,7 @@ Useful automation: notify when `binary_sensor.wireview_pro_ii_fault` turns on, o
 
 ## Releases
 
-GitHub Actions (`.github/workflows/build.yml`) runs the tests and builds the win-x64 zip on every push and pull request (download it from the run's artifacts). Pushing a tag like `v0.3.0` also creates a GitHub release with the zip attached:
-
-```
-git tag v0.3.0 && git push origin v0.3.0
-```
+GitHub Actions (`.github/workflows/build.yml`) runs the tests and builds the win-x64 zip on every push and pull request (download it from the run's artifacts). To make a release, either push a tag like `v0.3.0` (`git tag v0.3.0 && git push origin v0.3.0`), which creates the release, or create a release with a new `v…` tag on GitHub (*Releases > Draft a new release*). Either way the workflow builds the zip and attaches it.
 
 ## Build from source
 
