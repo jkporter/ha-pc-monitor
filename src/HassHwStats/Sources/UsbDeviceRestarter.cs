@@ -165,3 +165,95 @@ public static class UsbDeviceRestarter
         }
     }
 }
+
+/// <summary>
+/// Last resort: power-cycle the USB hub port the WireView is plugged into (IOCTL_USB_HUB_CYCLE_PORT), which makes
+/// Windows see an unplug and replug. Used only when a device restart did not bring the port back.
+/// </summary>
+[SupportedOSPlatform("windows")]
+public static class UsbHubPortCycler
+{
+    private const int CR_SUCCESS = 0;
+    private const uint IOCTL_USB_HUB_CYCLE_PORT = 0x220444;
+    private const int CM_GET_DEVICE_INTERFACE_LIST_PRESENT = 0;
+    private static readonly Guid GuidDevInterfaceUsbHub = new("f18a0e88-c30c-11d0-8815-00a0c906bed8");
+    private const int SPDRP_ADDRESS = 0x1C;
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Locate_DevNodeW(out int devInst, string deviceId, int flags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Get_Parent(out int parent, int devInst, int flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_IDW(int devInst, char[] buffer, int bufferLen, int flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_Interface_List_SizeW(out int len, ref Guid classGuid, string deviceId, int flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_Interface_ListW(ref Guid classGuid, string deviceId, char[] buffer, int bufferLen, int flags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Get_DevNode_Registry_PropertyW(int devInst, int property, out int regType, out int buffer, ref int length, int flags);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle device, uint code, ref UsbCyclePortParams inBuf, int inSize,
+        ref UsbCyclePortParams outBuf, int outSize, out int returned, IntPtr overlapped);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UsbCyclePortParams
+    {
+        public int ConnectionIndex;
+        public int StatusReturned;
+    }
+
+    private const int CM_DRP_ADDRESS = SPDRP_ADDRESS + 1; // CM_DRP_* = SPDRP_* + 1
+
+    private static string DeviceId(int devInst)
+    {
+        var buf = new char[512];
+        return CM_Get_Device_IDW(devInst, buf, buf.Length, 0) == CR_SUCCESS ? new string(buf).TrimEnd('\0') : "";
+    }
+
+    public static (bool Ok, string Message) CycleForPort(string? port)
+    {
+        var ids = UsbDeviceRestarter.FindInstanceIds(port);
+        if (ids.Count == 0) return (false, "no WireView USB device found in the device registry");
+        try
+        {
+            if (CM_Locate_DevNodeW(out int dev, ids[0], 0) != CR_SUCCESS) return (false, $"device {ids[0]} is not present");
+            // A composite device's serial interface (…&MI_00) sits under the USB device itself; the hub is one level above that.
+            if (DeviceId(dev).Contains("&MI_", StringComparison.OrdinalIgnoreCase) && CM_Get_Parent(out int usbDev, dev, 0) == CR_SUCCESS) dev = usbDev;
+
+            int len = sizeof(int);
+            if (CM_Get_DevNode_Registry_PropertyW(dev, CM_DRP_ADDRESS, out _, out int portNumber, ref len, 0) != CR_SUCCESS || portNumber <= 0)
+                return (false, "could not read the USB port number");
+            if (CM_Get_Parent(out int hub, dev, 0) != CR_SUCCESS) return (false, "could not find the parent USB hub");
+            var hubId = DeviceId(hub);
+
+            var guid = GuidDevInterfaceUsbHub;
+            if (CM_Get_Device_Interface_List_SizeW(out int size, ref guid, hubId, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS || size <= 1)
+                return (false, $"hub {hubId} has no device interface");
+            var list = new char[size];
+            if (CM_Get_Device_Interface_ListW(ref guid, hubId, list, size, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS)
+                return (false, $"cannot list interfaces of hub {hubId}");
+            var hubPath = new string(list).Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (hubPath is null) return (false, $"hub {hubId} has no device interface");
+
+            using var h = CreateFileW(hubPath, 0x40000000 /* GENERIC_WRITE */, 0x2 /* FILE_SHARE_WRITE */, IntPtr.Zero, 3 /* OPEN_EXISTING */, 0, IntPtr.Zero);
+            if (h.IsInvalid) return (false, $"cannot open hub: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+            var p = new UsbCyclePortParams { ConnectionIndex = portNumber };
+            if (!DeviceIoControl(h, IOCTL_USB_HUB_CYCLE_PORT, ref p, Marshal.SizeOf<UsbCyclePortParams>(), ref p, Marshal.SizeOf<UsbCyclePortParams>(), out _, IntPtr.Zero))
+                return (false, $"cycle port {portNumber} on {hubId} failed: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+            return (true, $"power-cycled port {portNumber} on {hubId}");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+}

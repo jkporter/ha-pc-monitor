@@ -23,13 +23,20 @@ public sealed class WireViewSource(
     Func<string, ISerialLink>? openLink = null,
     Func<IReadOnlyList<string>>? portNames = null,
     Func<IReadOnlyList<string>, string?>? findPort = null,
-    Func<string?, (bool Ok, string Message)>? restartDevice = null) : ISensorSource, IPowerAware
+    Func<string?, (bool Ok, string Message)>? restartDevice = null,
+    Func<string?, (bool Ok, string Message)>? cycleHubPort = null) : ISensorSource, IPowerAware
 {
     private readonly Func<string?, (bool Ok, string Message)> _restartDevice = restartDevice ?? DefaultRestart;
+    private readonly Func<string?, (bool Ok, string Message)> _cycleHubPort = cycleHubPort ?? DefaultCycle;
 
     private static (bool Ok, string Message) DefaultRestart(string? port) =>
         OperatingSystem.IsWindows() ? UsbDeviceRestarter.RestartForPort(port) : (false, "device restart is only supported on Windows");
 
+    private static (bool Ok, string Message) DefaultCycle(string? port) =>
+        OperatingSystem.IsWindows() ? UsbHubPortCycler.CycleForPort(port) : (false, "hub port cycling is only supported on Windows");
+
+    private Task? _closing;
+    private bool _restartedSinceConnect;
     /// <summary>ERROR_GEN_FAILURE as an HRESULT: "A device attached to the system is not functioning."</summary>
     internal const int GenFailureHResult = unchecked((int)0x8007001F);
     private static readonly TimeSpan MinRestartInterval = TimeSpan.FromSeconds(60);
@@ -318,6 +325,7 @@ public sealed class WireViewSource(
             _reconnectReason = null;
             _timeoutsInARow = _badFramesInARow = 0;
             _restartOnNextAttempt = false;
+            _restartedSinceConnect = false;
             log.LogInformation("Connected to {Model} on {Port}, UID {Uid}, {Sw}", WireViewProtocol.ModelName(vendor[1]), name, uid, sw);
             return true;
         }
@@ -343,18 +351,33 @@ public sealed class WireViewSource(
         }
         _lastRestartUtc = now;
         var port = _portName ?? options.Port;
-        log.LogInformation("Restarting the WireView USB device ({Port}) because: {Why}", port ?? "port unknown", why);
-        var (ok, message) = _restartDevice(port);
-        if (ok)
+
+        // A restart does not take effect while any handle to the port is open, so make sure the old one is gone.
+        Close();
+        if (_closing is { IsCompleted: false } closing && !closing.Wait(TimeSpan.FromSeconds(10)))
+            log.LogWarning("The old WireView port handle is still closing; restarting the device anyway");
+
+        bool ok;
+        string message;
+        if (!_restartedSinceConnect)
         {
-            log.LogInformation("WireView USB device restart: {Message}", message);
-            _usbStatus = "restarted the USB device, reconnecting";
+            log.LogInformation("Restarting the WireView USB device ({Port}) because: {Why}", port ?? "port unknown", why);
+            (ok, message) = _restartDevice(port);
+            _restartedSinceConnect = true;
+            _usbStatus = ok ? "restarted the USB device, reconnecting" : $"USB device restart failed ({message})";
+            // If that did not help, the next attempt power-cycles the hub port straight away.
+            _lastRestartUtc = DateTime.MinValue;
+            _restartOnNextAttempt = false;
         }
         else
         {
-            log.LogWarning("WireView USB device restart failed: {Message}", message);
-            _usbStatus = $"USB device restart failed ({message})";
+            log.LogInformation("Device restart did not bring the WireView back; power-cycling its USB hub port ({Port})", port ?? "port unknown");
+            (ok, message) = _cycleHubPort(port);
+            _restartedSinceConnect = false; // next round starts with a plain restart again, after the 60 s limit
+            _usbStatus = ok ? "power-cycled the USB port, reconnecting" : $"USB port power-cycle failed ({message})";
         }
+        if (ok) log.LogInformation("WireView USB recovery: {Message}", message);
+        else log.LogWarning("WireView USB recovery failed: {Message}", message);
         return ok;
     }
 
@@ -422,7 +445,7 @@ public sealed class WireViewSource(
         _port = null;
         if (port is null) return;
         // Closing a handle whose USB device vanished can block for a long time in the driver; don't stall polling on it.
-        var closing = Task.Run(() =>
+        var closing = _closing = Task.Run(() =>
         {
             try { port.Close(); } catch { /* already gone */ }
             try { port.Dispose(); } catch { /* already gone */ }

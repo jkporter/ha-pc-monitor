@@ -16,7 +16,15 @@ public class WireViewReconnectTests
         public bool Stalled;            // port open but the device never answers
         public bool Wedged;             // after S3: port listed, but every open/read fails with ERROR_GEN_FAILURE
         public bool RestartFixes = true;
-        public int Opens, Restarts;
+        public bool HandleOpen;         // a restart does nothing while a handle is open (seen on the real PC)
+        public int Opens, Restarts, Cycles;
+
+        public (bool, string) Cycle(string? port)
+        {
+            Cycles++;
+            Wedged = false;
+            return (true, "cycled");
+        }
 
         public static IOException GenFailure() =>
             new("A device attached to the system is not functioning.") { HResult = unchecked((int)0x8007001F) };
@@ -24,6 +32,7 @@ public class WireViewReconnectTests
         public (bool, string) Restart(string? port)
         {
             Restarts++;
+            if (HandleOpen) return (true, "restarted (no effect: handle open)");
             if (RestartFixes) Wedged = false;
             return (true, "restarted");
         }
@@ -35,6 +44,7 @@ public class WireViewReconnectTests
             if (Port is null || name != Port) throw new IOException($"The port '{name}' does not exist.");
             if (Wedged) throw GenFailure();
             Opens++;
+            HandleOpen = true;
             return new Link(this, name);
         }
 
@@ -45,8 +55,8 @@ public class WireViewReconnectTests
 
             public void DiscardInBuffer() { if (!Alive) throw new IOException("device removed"); _rx.Clear(); }
             public bool RtsEnable { set { } }
-            public void Close() { }
-            public void Dispose() { }
+            public void Close() => dev.HandleOpen = false;
+            public void Dispose() => dev.HandleOpen = false;
 
             public void Write(byte[] buffer, int offset, int count)
             {
@@ -79,7 +89,7 @@ public class WireViewReconnectTests
     {
         var dev = new FakeDevice();
         var source = new WireViewSource(new WireViewOptions { Source = "Usb" }, NullLogger<WireViewSource>.Instance,
-            dev.Open, dev.PortNames, ports => ports.FirstOrDefault(), dev.Restart);
+            dev.Open, dev.PortNames, ports => ports.FirstOrDefault(), dev.Restart, dev.Cycle);
         return (source, dev);
     }
 
@@ -207,6 +217,35 @@ public class WireViewReconnectTests
             Thread.Sleep(100);
         }
         Assert.Equal(1, dev.Restarts);
-        Assert.Contains("error 31", status);
+        Assert.Equal(1, dev.Cycles); // escalated once, then rate-limited
+    }
+
+    [Fact]
+    public void Power_cycles_the_hub_port_when_a_restart_does_not_help()
+    {
+        var (source, dev) = Create();
+        source.Start();
+        Assert.True(Connected(Poll(source)));
+
+        dev.RestartFixes = false;
+        dev.Wedged = true;
+        source.OnResume();
+        PollUntil(source, Connected, TimeSpan.FromSeconds(20));
+        Assert.Equal(1, dev.Restarts);
+        Assert.Equal(1, dev.Cycles);
+    }
+
+    [Fact]
+    public void Closes_the_port_before_restarting_the_device()
+    {
+        var (source, dev) = Create();
+        source.Start();
+        Assert.True(Connected(Poll(source)));
+
+        dev.Wedged = true;
+        source.OnResume(); // handle is still open at this point; the restart only works once it is closed
+        PollUntil(source, Connected, TimeSpan.FromSeconds(15));
+        Assert.Equal(1, dev.Restarts);
+        Assert.Equal(0, dev.Cycles);
     }
 }
