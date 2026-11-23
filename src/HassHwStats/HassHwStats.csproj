@@ -16,7 +16,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>HassHwStats</AssemblyName>
     <RootNamespace>HassHwStats</RootNamespace>
-    <Version>0.6.0</Version>
+    <Version>0.6.1</Version>
   </PropertyGroup>
 
   <ItemGroup>

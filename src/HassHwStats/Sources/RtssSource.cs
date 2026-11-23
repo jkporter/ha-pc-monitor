@@ -19,7 +19,10 @@ public sealed class RtssSource(HaDevice pcDevice, ILogger<RtssSource> log) : ISe
     private readonly SensorDefinition _fps = new("fps", "Frame rate", pcDevice, "fps", null, "measurement", "mdi:speedometer", 0, Group: "fps");
     private readonly SensorDefinition _frameTime = new("frame_time", "Frame time", pcDevice, "ms", "duration", "measurement", "mdi:timer-outline", 1, Group: "fps");
     private readonly SensorDefinition _app = new("game", "Game", pcDevice, Icon: "mdi:gamepad-variant", StateClass: null, Group: "fps");
-    private bool _warned;
+    private readonly SensorDefinition _status = new("rtss_status", "FPS source", pcDevice, Icon: "mdi:information-outline",
+        StateClass: null, EntityCategory: "diagnostic", Group: "fps.diag");
+    private string? _lastState;
+    private string? _error;
 
     public string Name => "RTSS";
 
@@ -27,41 +30,65 @@ public sealed class RtssSource(HaDevice pcDevice, ILogger<RtssSource> log) : ISe
 
     public IReadOnlyList<SensorValue> Poll()
     {
-        var best = ReadForegroundApp();
+        _error = null;
+        bool running;
+        (string Name, double Fps, double? FrameTimeMs)? best;
+        try
+        {
+            (running, best) = ReadForegroundApp();
+        }
+        catch (Exception ex)
+        {
+            (running, best) = (false, null);
+            _error = ex.Message;
+        }
+
+        string state, status;
+        if (_error is not null) (state, status) = ("error", $"Cannot read RTSS shared memory: {_error}");
+        else if (!running) (state, status) = ("missing", "RTSS not running. Start RivaTuner Statistics Server (or MSI Afterburner) for FPS.");
+        else if (best is null) (state, status) = ("idle", "RTSS running, no game detected");
+        else (state, status) = ("game", $"Reading {best.Value.Name}");
+        LogTransition(state, status);
+
+        // Without RTSS there is no frame data at all, so the entities are unavailable rather than 0.
+        if (state is "error" or "missing")
+            return [new(_status, status), new(_fps, null), new(_frameTime, null), new(_app, null)];
         if (best is null)
-            return [new(_fps, 0.0), new(_frameTime, null), new(_app, "None")];
+            return [new(_status, status), new(_fps, 0.0), new(_frameTime, null), new(_app, "None")];
         var (name, fps, frameTimeMs) = best.Value;
-        return [new(_fps, fps), new(_frameTime, frameTimeMs), new(_app, name)];
+        return [new(_status, status), new(_fps, fps), new(_frameTime, frameTimeMs), new(_app, name)];
     }
 
-    private (string Name, double Fps, double? FrameTimeMs)? ReadForegroundApp()
+    private void LogTransition(string state, string status)
+    {
+        // Log when RTSS appears, disappears or fails, not every poll (and not every game change).
+        var bucket = state == "game" ? "idle" : state;
+        if (bucket == _lastState) return;
+        bool first = _lastState is null;
+        _lastState = bucket;
+        if (bucket == "missing") log.LogWarning("RTSS shared memory (RTSSSharedMemoryV2) not found: RTSS is not running, so FPS is unavailable");
+        else if (bucket == "error") log.LogWarning("{Status}", status);
+        else log.LogInformation(first ? "RTSS found; reading FPS" : "RTSS is running again; reading FPS");
+    }
+
+    private (bool Running, (string Name, double Fps, double? FrameTimeMs)? Best) ReadForegroundApp()
     {
         MemoryMappedFile mmf;
         try
         {
             mmf = MemoryMappedFile.OpenExisting("RTSSSharedMemoryV2", MemoryMappedFileRights.Read);
         }
-        catch (FileNotFoundException)
+        catch (Exception ex) when (ex is FileNotFoundException or PlatformNotSupportedException)
         {
-            return null; // RTSS not running
-        }
-        catch (Exception ex) when (!_warned)
-        {
-            _warned = true;
-            log.LogWarning("Cannot open RTSS shared memory: {Message}", ex.Message);
-            return null;
-        }
-        catch
-        {
-            return null;
+            return (false, null); // RTSS not running (named mappings only exist on Windows)
         }
 
         using (mmf)
         using (var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
         {
-            if (view.ReadUInt32(0) != Signature) return null;
+            if (view.ReadUInt32(0) != Signature) throw new InvalidDataException("unexpected signature (RTSS starting or too old?)");
             uint version = view.ReadUInt32(4);
-            if (version < 0x00020000) return null;
+            if (version < 0x00020000) throw new InvalidDataException($"shared memory version {version:X} is older than 2.0; update RTSS");
             int entrySize = (int)view.ReadUInt32(8);
             long arrOffset = view.ReadUInt32(12);
             int count = (int)view.ReadUInt32(16);
@@ -97,7 +124,7 @@ public sealed class RtssSource(HaDevice pcDevice, ILogger<RtssSource> log) : ISe
                 bestTime = t1;
                 bestIsForeground = isForeground;
             }
-            return best;
+            return (true, best);
         }
     }
 

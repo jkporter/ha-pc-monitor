@@ -10,6 +10,7 @@ public sealed class Worker(AppOptions options, IReadOnlyList<ISensorSource> sour
 {
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
+        LogPrivileges(log);
         var active = StartSources(sources, log);
         var interval = TimeSpan.FromMilliseconds(Math.Max(250, options.IntervalMs));
         using var timer = new PeriodicTimer(interval);
@@ -45,6 +46,21 @@ public sealed class Worker(AppOptions options, IReadOnlyList<ISensorSource> sour
     }
 
     private string? _lastDashboard;
+
+    /// <summary>
+    /// CPU sensors and the WireView USB recovery (device restart, hub port cycle) need an elevated token. That holds for
+    /// both installs: the LocalSystem service and the logon scheduled task with "run with highest privileges".
+    /// </summary>
+    private static void LogPrivileges(ILogger log)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+        bool elevated = new System.Security.Principal.WindowsPrincipal(id).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        log.LogInformation("Running as {User} in session {Session}, {Elevation}", id.Name, System.Diagnostics.Process.GetCurrentProcess().SessionId,
+            elevated ? "elevated" : "NOT elevated");
+        if (!elevated)
+            log.LogWarning("Not running elevated: CPU temperatures/power and the automatic WireView USB reset will not work. Reinstall with install.ps1 (it sets 'run with highest privileges').");
+    }
 
     private static void NotifyResume(IEnumerable<ISensorSource> sources)
     {

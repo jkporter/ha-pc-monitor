@@ -59,7 +59,7 @@ public static class DashboardWriter
         EntitiesCard(y, "GPU", defs.Where(d => d.Group?.StartsWith("gpu.") == true));
         EntitiesCard(y, "CPU", defs.Where(d => d.Group?.StartsWith("cpu.main.") == true));
         EntitiesCard(y, "RAM", defs.Where(d => d.Group?.StartsWith("ram.") == true));
-        foreach (var other in defs.Where(d => d.Group is { } g && !g.StartsWith("cpu.") && !g.StartsWith("gpu.") && !g.StartsWith("ram.") && !g.StartsWith("wireview") && g != "fps")
+        foreach (var other in defs.Where(d => d.Group is { } g && !g.StartsWith("cpu.") && !g.StartsWith("gpu.") && !g.StartsWith("ram.") && !g.StartsWith("wireview") && !g.StartsWith("fps"))
                      .GroupBy(d => d.Device.Name))
             EntitiesCard(y, other.Key, other);
         y.Indent -= 2;

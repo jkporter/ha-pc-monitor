@@ -6,7 +6,7 @@ Publishes gaming-overlay-style PC stats to Home Assistant over MQTT, with auto-d
 |---|---|
 | **LibreHardwareMonitor** (built in) | CPU load, package temp, package power, core voltage, highest/average core clock. GPU core/memory/video-engine load, core/memory clocks, core/hot-spot/memory-junction temps, board power, fan RPM and %, VRAM used/free/total. RAM load and used/available. Optional: motherboard temps/fans, drive temps, network throughput. |
 | **Thermal Grizzly WireView Pro II** or Noctua Edition (USB) | Total power, current and voltage on the 12V-2x6 cable; per-pin voltage/current/power (6 pins); connector input/output temps and the two external probes; fan duty; cable rating; highest pin current and current imbalance %; a Fault binary sensor plus active and logged fault names. |
-| **RTSS** (RivaTuner Statistics Server, ships with MSI Afterburner) | Frame rate, frame time and the name of the game, when RTSS is running. |
+| **RTSS** (RivaTuner Statistics Server, ships with MSI Afterburner) | Frame rate, frame time and the name of the game. RTSS has to be running; otherwise those entities are *unavailable* and the PC's *FPS source* entity says "RTSS not running". |
 
 In Home Assistant each piece of hardware is its own device (e.g. "Gaming-PC CPU", "Gaming-PC GPU", "WireView Pro II"), all linked to a "Gaming-PC" device. If the PC goes off, everything turns *unavailable* (MQTT last will).
 
