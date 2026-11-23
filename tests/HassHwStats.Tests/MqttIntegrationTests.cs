@@ -61,7 +61,8 @@ public class MqttIntegrationTests
         await publisher.PublishReadingsAsync([new(power, 412.3456), new(pin1, 8.123), new(fps, 143.7)], CancellationToken.None);
 
         var deviceTopic = $"{prefix}/device/test_rig_wireview/config";
-        await WaitFor(() => latest.ContainsKey($"{baseTopic}/test_rig/wireview/state") && latest.GetValueOrDefault(legacyTopic) == "");
+        await WaitFor(() => latest.ContainsKey($"{baseTopic}/test_rig/wireview/state") && latest.ContainsKey($"{baseTopic}/test_rig/pc/state")
+                           && latest.GetValueOrDefault(legacyTopic) == "");
 
         // Order matters for HA: migrate the old config, publish the device config, then clear the old one.
         var msgs = log.ToList();

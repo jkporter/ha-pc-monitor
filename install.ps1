@@ -9,6 +9,10 @@
 
   -AsService: a Windows service instead. Starts before logon, but FPS from RTSS will not work.
 
+  It also turns off USB power saving for the WireView Pro II (the "Allow the computer to turn off this device"
+  checkbox and USB selective suspend). Windows suspending the device is what usually drops the connection after
+  sleep, for this app and for Thermal Grizzly's. Use -SkipUsbPowerFix to leave those settings alone.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AsService
@@ -16,7 +20,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir = "$env:ProgramFiles\HassHwStats",
-    [switch]$AsService
+    [switch]$AsService,
+    [switch]$SkipUsbPowerFix
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +32,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Host 'Re-launching elevated...'
     $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-InstallDir', "`"$InstallDir`"")
     if ($AsService) { $argsList += '-AsService' }
+    if ($SkipUsbPowerFix) { $argsList += '-SkipUsbPowerFix' }
     Start-Process powershell -Verb RunAs -ArgumentList $argsList -Wait
     exit
 }
@@ -53,6 +59,32 @@ if (Test-Path $config) {
 if (-not (Get-Service PawnIO -ErrorAction SilentlyContinue)) {
     Write-Warning 'PawnIO driver not found. CPU temperatures and power need it: install from https://pawnio.eu (or: winget install namazso.PawnIO).'
 }
+
+function Disable-WireViewUsbPowerSaving {
+    # The WireView Pro II enumerates as USB\VID_0483&PID_5740 (plus an &MI_xx interface on some systems).
+    $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_0483&PID_5740' }
+    if (-not $devices) {
+        Write-Warning 'WireView Pro II not found, so USB power saving was left as is. Plug it in and re-run install.ps1 to apply it.'
+        return
+    }
+    $wmi = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue)
+    foreach ($d in $devices) {
+        # "Allow the computer to turn off this device to save power" in Device Manager > Power Management.
+        foreach ($p in $wmi | Where-Object { $_.InstanceName -like "$($d.InstanceId)*" }) {
+            if ($p.Enable) { Set-CimInstance -InputObject $p -Property @{ Enable = $false } -ErrorAction SilentlyContinue }
+        }
+        # USB selective suspend for this device only.
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($d.InstanceId)\Device Parameters"
+        if (Test-Path $key) {
+            foreach ($name in 'SelectiveSuspendEnabled', 'EnhancedPowerManagementEnabled', 'AllowIdleIrpInD3') {
+                New-ItemProperty -Path $key -Name $name -Value 0 -PropertyType DWord -Force | Out-Null
+            }
+        }
+    }
+    Write-Host "Turned off USB power saving for the WireView Pro II ($(@($devices).Count) device entries). Unplug and replug it, or reboot, for it to take full effect." -ForegroundColor Green
+}
+
+if (-not $SkipUsbPowerFix) { Disable-WireViewUsbPowerSaving }
 
 if ($AsService) {
     Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue

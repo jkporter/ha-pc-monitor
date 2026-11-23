@@ -15,11 +15,22 @@ public sealed class Worker(AppOptions options, IReadOnlyList<ISensorSource> sour
         using var timer = new PeriodicTimer(interval);
         var slow = Stopwatch.StartNew();
         var seen = new Dictionary<string, SensorDefinition>();
+        var lastTick = DateTime.UtcNow;
+        SubscribePowerEvents(active);
         var dashboardPath = Path.Combine(AppContext.BaseDirectory, "dashboard.yaml");
 
         do
         {
             var sw = Stopwatch.StartNew();
+            // Wall-clock gap much longer than the interval: the PC slept or hibernated. This also works as a
+            // Windows service in session 0, where SystemEvents never reports power changes.
+            var now = DateTime.UtcNow;
+            if (now - lastTick > interval + TimeSpan.FromSeconds(30))
+            {
+                log.LogInformation("No poll for {Seconds:0} s; assuming the PC was asleep", (now - lastTick).TotalSeconds);
+                NotifyResume(active);
+            }
+            lastTick = now;
             var values = PollAll(active, log);
             await publisher.PublishReadingsAsync(values, ct);
             if (options.WriteDashboard && values.Any(v => seen.TryAdd(v.Definition.Key, v.Definition)))
@@ -34,6 +45,30 @@ public sealed class Worker(AppOptions options, IReadOnlyList<ISensorSource> sour
     }
 
     private string? _lastDashboard;
+
+    private static void NotifyResume(IEnumerable<ISensorSource> sources)
+    {
+        foreach (var s in sources.OfType<IPowerAware>()) s.OnResume();
+    }
+
+    /// <summary>Immediate notice of a wake-up when running in the desktop session (the default scheduled-task install).</summary>
+    private void SubscribePowerEvents(IReadOnlyList<ISensorSource> active)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            Microsoft.Win32.SystemEvents.PowerModeChanged += (_, e) =>
+            {
+                if (e.Mode != Microsoft.Win32.PowerModes.Resume) return;
+                log.LogInformation("Windows reported a resume from sleep");
+                NotifyResume(active);
+            };
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug("Power events unavailable: {Message}", ex.Message);
+        }
+    }
 
     private void WriteDashboard(string path, IReadOnlyCollection<SensorDefinition> defs, ILogger log)
     {

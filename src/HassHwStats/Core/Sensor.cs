@@ -37,3 +37,10 @@ public interface ISensorSource : IDisposable
     /// <summary>Read the current values. May return a different set of sensors over time (hot-plug).</summary>
     IReadOnlyList<SensorValue> Poll();
 }
+
+/// <summary>A source that needs to know when the PC woke from sleep or hibernation.</summary>
+public interface IPowerAware
+{
+    /// <summary>Called from any thread; implementations should only set a flag and act on the next poll.</summary>
+    void OnResume();
+}
