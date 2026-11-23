@@ -14,13 +14,26 @@ public class WireViewReconnectTests
     {
         public string? Port = "COM5";   // null = unplugged
         public bool Stalled;            // port open but the device never answers
-        public int Opens;
+        public bool Wedged;             // after S3: port listed, but every open/read fails with ERROR_GEN_FAILURE
+        public bool RestartFixes = true;
+        public int Opens, Restarts;
+
+        public static IOException GenFailure() =>
+            new("A device attached to the system is not functioning.") { HResult = unchecked((int)0x8007001F) };
+
+        public (bool, string) Restart(string? port)
+        {
+            Restarts++;
+            if (RestartFixes) Wedged = false;
+            return (true, "restarted");
+        }
 
         public IReadOnlyList<string> PortNames() => Port is null ? [] : [Port];
 
         public ISerialLink Open(string name)
         {
             if (Port is null || name != Port) throw new IOException($"The port '{name}' does not exist.");
+            if (Wedged) throw GenFailure();
             Opens++;
             return new Link(this, name);
         }
@@ -53,6 +66,7 @@ public class WireViewReconnectTests
             public int Read(byte[] buffer, int offset, int count)
             {
                 if (!Alive) throw new IOException("device removed");
+                if (dev.Wedged) throw GenFailure();
                 if (_rx.Count == 0) throw new TimeoutException();
                 int n = 0;
                 while (n < count && _rx.Count > 0) buffer[offset + n++] = _rx.Dequeue();
@@ -65,7 +79,7 @@ public class WireViewReconnectTests
     {
         var dev = new FakeDevice();
         var source = new WireViewSource(new WireViewOptions { Source = "Usb" }, NullLogger<WireViewSource>.Instance,
-            dev.Open, dev.PortNames, ports => ports.FirstOrDefault());
+            dev.Open, dev.PortNames, ports => ports.FirstOrDefault(), dev.Restart);
         return (source, dev);
     }
 
@@ -147,5 +161,52 @@ public class WireViewReconnectTests
         var (source, _) = Create();
         source.Start();
         Assert.True(Connected(Poll(source)));
+    }
+
+    [Fact]
+    public void Restarts_the_usb_device_when_it_is_wedged_after_wake()
+    {
+        var (source, dev) = Create();
+        source.Start();
+        Assert.True(Connected(Poll(source)));
+
+        dev.Wedged = true; // S3 resume left usbser half-dead: COM15 listed, opens fail with error 31
+        source.OnResume();
+        var v = PollUntil(source, Connected, TimeSpan.FromSeconds(15));
+        Assert.Equal(1, dev.Restarts);
+        Assert.StartsWith("Connected over USB", (string)v["wireview_status"]!);
+    }
+
+    [Fact]
+    public void Restarts_the_usb_device_on_gen_failure_without_a_wake_event()
+    {
+        var (source, dev) = Create();
+        source.Start();
+        Assert.True(Connected(Poll(source)));
+
+        dev.Wedged = true; // reads start failing with ERROR_GEN_FAILURE
+        Assert.False(Connected(Poll(source)));
+        PollUntil(source, Connected, TimeSpan.FromSeconds(15));
+        Assert.Equal(1, dev.Restarts);
+    }
+
+    [Fact]
+    public void Restarts_at_most_once_a_minute()
+    {
+        var (source, dev) = Create();
+        source.Start();
+        Assert.True(Connected(Poll(source)));
+
+        dev.RestartFixes = false;
+        dev.Wedged = true;
+        var sw = Stopwatch.StartNew();
+        string? status = null;
+        while (sw.Elapsed < TimeSpan.FromSeconds(8))
+        {
+            status = (string?)Poll(source)["wireview_status"];
+            Thread.Sleep(100);
+        }
+        Assert.Equal(1, dev.Restarts);
+        Assert.Contains("error 31", status);
     }
 }

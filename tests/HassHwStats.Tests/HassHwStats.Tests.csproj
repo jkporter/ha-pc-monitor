@@ -18,6 +18,7 @@
     <Compile Include="../../src/HassHwStats/Sources/HwinfoSharedMemory.cs" Link="Linked/HwinfoSharedMemory.cs" />
     <Compile Include="../../src/HassHwStats/Sources/WireViewEntities.cs" Link="Linked/WireViewEntities.cs" />
     <Compile Include="../../src/HassHwStats/Sources/WireViewSource.cs" Link="Linked/WireViewSource.cs" />
+    <Compile Include="../../src/HassHwStats/Sources/UsbDeviceRestarter.cs" Link="Linked/UsbDeviceRestarter.cs" />
     <Compile Include="../../src/HassHwStats/Mqtt/HomeAssistantPayloads.cs" Link="Linked/HomeAssistantPayloads.cs" />
     <Compile Include="../../src/HassHwStats/Mqtt/MqttPublisher.cs" Link="Linked/MqttPublisher.cs" />
   </ItemGroup>

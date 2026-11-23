@@ -22,8 +22,20 @@ public sealed class WireViewSource(
     ILogger<WireViewSource> log,
     Func<string, ISerialLink>? openLink = null,
     Func<IReadOnlyList<string>>? portNames = null,
-    Func<IReadOnlyList<string>, string?>? findPort = null) : ISensorSource, IPowerAware
+    Func<IReadOnlyList<string>, string?>? findPort = null,
+    Func<string?, (bool Ok, string Message)>? restartDevice = null) : ISensorSource, IPowerAware
 {
+    private readonly Func<string?, (bool Ok, string Message)> _restartDevice = restartDevice ?? DefaultRestart;
+
+    private static (bool Ok, string Message) DefaultRestart(string? port) =>
+        OperatingSystem.IsWindows() ? UsbDeviceRestarter.RestartForPort(port) : (false, "device restart is only supported on Windows");
+
+    /// <summary>ERROR_GEN_FAILURE as an HRESULT: "A device attached to the system is not functioning."</summary>
+    internal const int GenFailureHResult = unchecked((int)0x8007001F);
+    private static readonly TimeSpan MinRestartInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan AfterRestartSettle = TimeSpan.FromSeconds(2);
+    private DateTime _lastRestartUtc = DateTime.MinValue;
+    private bool _restartOnNextAttempt;
     private readonly Func<IReadOnlyList<string>, string?> _findPort = findPort ?? FindPort;
     private readonly Func<string, ISerialLink> _openLink = openLink ?? (name => new SerialPortLink(name));
     private readonly Func<IReadOnlyList<string>> _portNames = portNames ?? SerialPort.GetPortNames;
@@ -72,6 +84,8 @@ public sealed class WireViewSource(
                 log.LogInformation("PC woke from sleep; reopening the WireView connection");
                 Close();
                 _reconnectReason = "PC woke from sleep";
+                // After S3 resume the usbser device can be left half-dead until it is restarted.
+                _restartOnNextAttempt = true;
                 _backoff.RestartAfter(DateTime.UtcNow, ResumeSettle);
             }
         }
@@ -94,6 +108,12 @@ public sealed class WireViewSource(
         var now = DateTime.UtcNow;
         if (_useUsb && _backoff.IsDue(now))
         {
+            if (_restartOnNextAttempt && TryRestartDevice(_reconnectReason ?? "reconnect"))
+            {
+                // Give PnP a moment to bring the COM port back, then open it.
+                _backoff.RestartAfter(now, AfterRestartSettle);
+                return Disconnected(hwinfoStatus);
+            }
             if (TryConnect())
             {
                 _backoff.Reset();
@@ -106,6 +126,11 @@ public sealed class WireViewSource(
             }
         }
 
+        return Disconnected(hwinfoStatus);
+    }
+
+    private IReadOnlyList<SensorValue> Disconnected(string? hwinfoStatus)
+    {
         SetActive(null);
         var parts = new List<string>();
         if (_useUsb)
@@ -147,6 +172,7 @@ public sealed class WireViewSource(
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
         {
+            if (ex.HResult == GenFailureHResult) _restartOnNextAttempt = true;
             return Lost(ex.Message);
         }
     }
@@ -245,6 +271,14 @@ public sealed class WireViewSource(
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
         {
+            if (ex.HResult == GenFailureHResult)
+            {
+                // The port exists but the device behind it is wedged (typical after sleep): restart it on the next attempt.
+                _restartOnNextAttempt = true;
+                _reconnectReason ??= "USB device not responding";
+                _usbStatus = $"{name} reports the device is not functioning (Windows error 31); restarting the USB device";
+                return false;
+            }
             _usbStatus = ex is UnauthorizedAccessException
                 ? $"{name} is in use by another program. Close the Thermal Grizzly WireView app, or let HWiNFO read it (Shared Memory Support on)."
                 : $"cannot open {name}: {ex.Message}";
@@ -283,6 +317,7 @@ public sealed class WireViewSource(
             _everConnected = true;
             _reconnectReason = null;
             _timeoutsInARow = _badFramesInARow = 0;
+            _restartOnNextAttempt = false;
             log.LogInformation("Connected to {Model} on {Port}, UID {Uid}, {Sw}", WireViewProtocol.ModelName(vendor[1]), name, uid, sw);
             return true;
         }
@@ -294,6 +329,33 @@ public sealed class WireViewSource(
                 : $"handshake on {name} failed: {ex.Message}";
             return false;
         }
+    }
+
+    /// <summary>Restart the WireView's USB device, at most once a minute. Returns true when a restart was performed.</summary>
+    private bool TryRestartDevice(string why)
+    {
+        _restartOnNextAttempt = false;
+        var now = DateTime.UtcNow;
+        if (now - _lastRestartUtc < MinRestartInterval)
+        {
+            log.LogDebug("Skipping WireView USB restart; the last one was {Seconds:0} s ago", (now - _lastRestartUtc).TotalSeconds);
+            return false;
+        }
+        _lastRestartUtc = now;
+        var port = _portName ?? options.Port;
+        log.LogInformation("Restarting the WireView USB device ({Port}) because: {Why}", port ?? "port unknown", why);
+        var (ok, message) = _restartDevice(port);
+        if (ok)
+        {
+            log.LogInformation("WireView USB device restart: {Message}", message);
+            _usbStatus = "restarted the USB device, reconnecting";
+        }
+        else
+        {
+            log.LogWarning("WireView USB device restart failed: {Message}", message);
+            _usbStatus = $"USB device restart failed ({message})";
+        }
+        return ok;
     }
 
     /// <summary>
